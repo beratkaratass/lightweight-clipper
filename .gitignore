@@ -1,0 +1,6 @@
+# personal settings (paths, mic name) and build output
+config.json
+dist/
+build/
+*.spec
+__pycache__/
