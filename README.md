@@ -16,13 +16,13 @@ winget install Gyan.FFmpeg.Essentials
 
 1. Download <https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip>.
 2. Unzip it and open the `bin` folder.
-3. Copy `ffmpeg.exe` into the same folder as `Lightweight Clipper.exe`.
+3. Copy `ffmpeg.exe` into the same folder as `LightweightClipper.exe`.
 
 Tested with ffmpeg 9.0.1; use a recent build.
 
 ## 2. Run it
 
-Double-click `Lightweight Clipper.exe`. Recording starts right away.
+Download `LightweightClipper.exe` from [Releases](https://github.com/beratkaratass/lightweight-clipper/releases/latest) and double-click it. Recording starts right away.
 
 The first time, Windows SmartScreen may say *"Windows protected your PC"*, because the exe isn't code-signed. Click **More info → Run anyway**.
 
