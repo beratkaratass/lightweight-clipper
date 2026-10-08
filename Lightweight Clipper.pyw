@@ -21,11 +21,32 @@ FF = next((str(p) for p in [APP / 'ffmpeg.exe', *sorted(WINGET.glob('Gyan.FFmpeg
 NOWIN = subprocess.CREATE_NO_WINDOW
 user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
 
-# (name, capture fps, Mbps, NVENC preset, AMF quality). Game-FPS cost is mostly capture fps; NVENC has its own chip.
-PRESETS = [('Max FPS', 30, 8, 'p1', 'speed'), ('Light', 60, 12, 'p2', 'speed'), ('Balanced', 60, 20, 'p4', 'balanced'),
-           ('High', 60, 35, 'p6', 'quality'), ('Max quality', 60, 60, 'p7', 'quality')]
-DEFAULTS = dict(monitor=0, res='Native', quality=2, length=60, encoder='h264_nvenc', audio='None', exclude=[],
-                hotkey=[0x38, 0x44], folder=str(Path.home() / 'Videos' / NAME))  # hotkey: Alt + F10
+# (name, capture fps, Mbps). Game-FPS cost is mostly capture fps; hardware encoders run on their own chip.
+PRESETS = [('Max FPS', 30, 8), ('Light', 60, 12), ('Balanced', 60, 20), ('High', 60, 35), ('Max quality', 60, 60)]
+# encoder -> (filters after the screen capture, its speed/quality option, that option's value per preset, fixed extras)
+# NVENC stops at p5 and runs without B-frames: measured on 1440p60 game footage, p6/p7 and B-frames score within one
+# VMAF point of this (not visible) but hold 570-740 MB of VRAM instead of 240 MB, and 2-4x the RAM.
+ENCODERS = {
+    'h264_nvenc': ('', '-preset', ('p1', 'p2', 'p4', 'p5', 'p5'), ('-bf', '0')),
+    'hevc_nvenc': ('', '-preset', ('p1', 'p2', 'p4', 'p5', 'p5'), ('-bf', '0')),
+    'h264_amf': ('', '-quality', ('speed', 'speed', 'balanced', 'quality', 'quality'), ()),
+    'hevc_amf': ('', '-quality', ('speed', 'speed', 'balanced', 'quality', 'quality'), ()),
+    'h264_qsv': (',hwmap=derive_device=qsv,format=qsv', '-preset', ('veryfast', 'veryfast', 'faster', 'medium', 'medium'), ()),
+    # CPU encoding: frames are copied off the GPU and compressed by the processor. Works anywhere, costs real CPU.
+    'libx264': (',hwdownload,format=bgra', '-preset', ('ultrafast', 'ultrafast', 'superfast', 'superfast', 'veryfast'), ('-pix_fmt', 'yuv420p')),
+}
+AUTO = ['h264_nvenc', 'h264_amf', 'h264_qsv', 'libx264']  # 'Auto' tries these in order and keeps the first that records
+detected = {}  # 'encoder': what Auto resolved to on this PC; 'errors': why the ones before it failed
+DEFAULTS = dict(monitor=0, res='Native', quality=2, length=60, encoder='Auto', audio='None', exclude=[],
+                hotkey=[0x38, 0x44], rec_hotkey=[0x38, 0x43],  # Alt + F10 saves a clip, Alt + F9 starts/stops recording
+                folder=str(Path.home() / 'Videos' / NAME))
+HOTKEYS = {'hotkey': 1, 'rec_hotkey': 2}  # config key -> Keys id
+LENGTHS = [15, 30, 45, 60, 90, 120, 180, 300, 600]
+CUSTOM = 'Custom…'
+
+
+def length_values(current):  # presets, the current custom length if any, then the way to type one
+    return sorted(set(LENGTHS) | {int(current)}) + [CUSTOM]
 # Keys are physical scancodes (+0x100 when E0-prefixed), so ç/ö/. work on any layout and survive layout switches.
 MOD_BITS = {0x38: 1, 0x1D: 2, 0x2A: 4, 0x15B: 8}  # Alt, Ctrl, Shift, Win -> RegisterHotKey modifier flags
 NORMALIZE = {0x36: 0x2A, 0x11D: 0x1D, 0x138: 0x38, 0x15C: 0x15B}  # right Shift/Ctrl/Alt/Win count as left
@@ -165,6 +186,7 @@ def theme(root):
     s.configure('Title.TLabel', foreground=FG, font=(FAM, 20, 'bold'))
     s.configure('Section.TLabel', foreground=DIM, font=(FAM, 8, 'bold'))
     s.configure('Status.TLabel', foreground=MUTED)
+    s.configure('Tab.TLabel', foreground=MUTED, font=(FAM, 11, 'bold'))
     keep = root._imgs = []  # Tk blanks PhotoImages once Python garbage-collects them
 
     def element(name, default, *states, **kw):  # states: (ttk state..., image), first match wins
@@ -406,8 +428,8 @@ class Keys(threading.Thread):
 
     def __init__(self, fire, status, captured):
         super().__init__(daemon=True)
-        self.fire, self.status, self.captured = fire, status, captured
-        self.combo, self.capture, self.held, self.last, self.last_press = [], None, set(), {}, 0
+        self.fire, self.status, self.captured = fire, status, captured  # fire(hotkey id)
+        self.combos, self.capture, self.held, self.last, self.last_press = {}, None, set(), {}, 0  # combos: id -> keys
         self.tid, self.hwnd, self.ready = 0, None, threading.Event()
 
     def update(self):  # UI thread changed combo/capture: re-arm on our own thread (hotkeys belong to a thread)
@@ -421,8 +443,8 @@ class Keys(threading.Thread):
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == 0x8001:
                 self.arm()
-            elif msg.message == 0x0312:  # WM_HOTKEY
-                self.fire()
+            elif msg.message == 0x0312:  # WM_HOTKEY, wParam = our id
+                self.fire(msg.wParam)
             elif msg.message == 0x00FF:  # WM_INPUT
                 size.value = ctypes.sizeof(ri)
                 if user32.GetRawInputData(msg.lParam, 0x10000003, ctypes.byref(ri), ctypes.byref(size), RAW_HEADER) > 0:
@@ -430,11 +452,13 @@ class Keys(threading.Thread):
             user32.DispatchMessageW(ctypes.byref(msg))  # lets Windows clean up after WM_INPUT
 
     def arm(self):
-        user32.UnregisterHotKey(None, 1)
-        c = self.combo
-        std = self.capture is None and len(c) > 1 and c[-1] not in MOD_BITS and all(k in MOD_BITS for k in c[:-1])
-        registered = std and user32.RegisterHotKey(None, 1, sum(MOD_BITS[k] for k in set(c[:-1])) | 0x4000, scan_vk(c[-1]))
-        raw = self.capture is not None or bool(c and not registered)  # taken by another app? Raw Input still sees it
+        self.raw_ids = set()  # combos Raw Input has to watch: not plain modifier+key, or taken by another app
+        for i, c in self.combos.items():
+            user32.UnregisterHotKey(None, i)
+            std = self.capture is None and len(c) > 1 and c[-1] not in MOD_BITS and all(k in MOD_BITS for k in c[:-1])
+            if c and not (std and user32.RegisterHotKey(None, i, sum(MOD_BITS[k] for k in set(c[:-1])) | 0x4000, scan_vk(c[-1]))):
+                self.raw_ids.add(i)
+        raw = self.capture is not None or bool(self.raw_ids)
         rid = RAWINPUTDEVICE(1, 6, 0x100 if raw else 1, self.hwnd if raw else None)  # INPUTSINK: also in background
         user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(rid))
         self.held.clear()
@@ -463,10 +487,11 @@ class Keys(threading.Thread):
                 self.capture.append(code)
                 self.captured(list(self.capture))
             return
-        c = self.combo  # the last key triggers; the rest count if held or pressed within WINDOW, in any order
-        if c and code == c[-1] and all(now - self.last.get(k, -9) <= self.WINDOW or
-                                       (k in self.held and user32.GetAsyncKeyState(scan_vk(k)) & 0x8000) for k in c[:-1]):
-            self.fire()
+        for i in getattr(self, 'raw_ids', self.combos):  # the last key triggers; the rest count if held or pressed
+            c = self.combos.get(i)                          # within WINDOW, in any order
+            if c and code == c[-1] and all(now - self.last.get(k, -9) <= self.WINDOW or
+                                           (k in self.held and user32.GetAsyncKeyState(scan_vk(k)) & 0x8000) for k in c[:-1]):
+                self.fire(i)
 
 
 WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
@@ -579,7 +604,7 @@ def audio_devices():
 
 
 # ---- PC audio: WASAPI process loopback (Win10 20348+ / Win11) -> named pipe -> ffmpeg ----
-PIPE = r'\\.\pipe\LightweightClipper.audio'
+PIPE = rf'\\.\pipe\LightweightClipper.audio.{os.getpid()}'  # per process: two copies must never swap audio feeds
 INVALID = wintypes.HANDLE(-1).value
 ole32, mmdevapi = ctypes.windll.ole32, ctypes.windll.mmdevapi
 k32 = ctypes.WinDLL('kernel32', use_last_error=True)  # own instance: typed signatures, reliable GetLastError
@@ -614,6 +639,12 @@ class PROCESSENTRY32W(ctypes.Structure):
     _fields_ = [('size', wintypes.DWORD), ('usage', wintypes.DWORD), ('pid', wintypes.DWORD), ('heap', ctypes.c_size_t),
                 ('module', wintypes.DWORD), ('threads', wintypes.DWORD), ('ppid', wintypes.DWORD), ('prio', ctypes.c_long),
                 ('flags', wintypes.DWORD), ('exe', ctypes.c_wchar * 260)]
+
+
+def process_ids():  # every running pid, in one cheap call: changes whenever a process starts or exits
+    ids, size = (wintypes.DWORD * 8192)(), wintypes.DWORD()
+    ctypes.windll.psapi.EnumProcesses(ids, ctypes.sizeof(ids), ctypes.byref(size))
+    return ctypes.string_at(ids, size.value)
 
 
 def processes():  # [(pid, parent pid, exe name)]
@@ -731,16 +762,24 @@ class AppAudio(threading.Thread):
 
     def __init__(self, skip, status):
         super().__init__(daemon=True)
-        self.skip, self.status, self.stopped = skip, status, False
+        self.skip, self.status, self.stopped, self.planned = skip, status, False, (None, None)
         self.pipe = k32.CreateNamedPipeW(PIPE, 2, 0, 255, 1 << 20, 0, 0, None)  # outbound, byte stream, 1 MB buffer
 
     def plan(self):
         """Clients to run: {('x', pid)} = everything but pid's tree, or {('i', pid), ...} = only these trees."""
+        skip = frozenset(s.lower() for s in self.skip)
+        if not skip:
+            return {('x', os.getpid())}  # our own tree plays nothing but save beeps
+        key = process_ids(), skip  # the full process scan below costs ~8 ms: only redo it when a process came or went
+        if key == self.planned[0]:
+            return self.planned[1]
         procs = processes()
-        parent, name, skip = {p: pp for p, pp, _ in procs}, {p: n.lower() for p, _, n in procs}, {s.lower() for s in self.skip}
+        parent, name = {p: pp for p, pp, _ in procs}, {p: n.lower() for p, _, n in procs}
         roots = [p for p in name if name[p] in skip and name.get(parent[p]) != name[p]]
         if len(roots) <= 1:
-            return {('x', roots[0] if roots else os.getpid())}  # our own tree plays nothing but save beeps
+            self.planned = key, {('x', roots[0] if roots else os.getpid())}
+            return self.planned[1]
+        self.planned = None, None  # per-app mode also depends on who has audio sessions: work it out every time
 
         def lineage(p):  # p and its ancestors
             chain = []
@@ -808,10 +847,38 @@ class AppAudio(threading.Thread):
             k32.CloseHandle(self.pipe)
 
 
+def codec(c):  # the encoder actually used: the picked one, or what Auto found on this PC
+    return c['encoder'] if c['encoder'] in ENCODERS else detected.get('encoder', AUTO[0])
+
+
+def screen(c, fps):  # ffmpeg's capture source, plus whatever this encoder needs done to the frames first
+    return f"ddagrab=output_idx={c['monitor']}:framerate={fps}" + ENCODERS[codec(c)][0]
+
+
 def enc_args(c):
-    _, _, br, nv_preset, amf_quality = PRESETS[c['quality']]
-    speed = ['-preset', nv_preset] if 'nvenc' in c['encoder'] else ['-quality', amf_quality]
-    return ['-c:v', c['encoder'], *speed, '-b:v', f'{br}M', '-maxrate', f'{br}M', '-bufsize', f'{br * 2}M']
+    _, option, levels, extra = ENCODERS[codec(c)]
+    br = PRESETS[c['quality']][2]
+    return ['-c:v', codec(c), option, levels[c['quality']], *extra, '-b:v', f'{br}M', '-maxrate', f'{br}M', '-bufsize', f'{br * 2}M']
+
+
+def detect_encoder(monitor, first=None):
+    """The first encoder that really records this screen: `first` (the user's pick), then the Auto order.
+    Handles AMD and Intel GPUs, laptops whose display runs off the integrated GPU, drivers too old for NVENC...
+    Returns (encoder or None, [why each one before it failed])."""
+    errors = []
+    for enc in dict.fromkeys(([first] if first in ENCODERS else []) + AUTO):
+        c = dict(monitor=monitor, quality=2, encoder=enc)
+        try:
+            r = subprocess.run([FF, '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', screen(c, 30), *enc_args(c),
+                                '-frames:v', '5', '-f', 'null', '-'], capture_output=True, text=True, errors='ignore',
+                               timeout=15, creationflags=NOWIN)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            errors.append(f'{enc}: {e}')
+            continue
+        if r.returncode == 0:
+            return enc, errors
+        errors.append(f'{enc}: ' + re.sub(r'^\[[^\]]*\]\s*', '', (r.stderr.strip().splitlines() or ['failed'])[0]))
+    return None, errors
 
 
 def record_cmd(c):
@@ -819,7 +886,7 @@ def record_cmd(c):
     fps = PRESETS[c['quality']][1]
     # -xerror: if the capture dies (display mode change, lock screen, UAC), exit instead of carrying on audio-only,
     # which piled hours of audio into one segment; the watchdog then restarts capture
-    cmd = [FF, '-hide_banner', '-loglevel', 'error', '-xerror', '-f', 'lavfi', '-i', f"ddagrab=output_idx={c['monitor']}:framerate={fps}"]
+    cmd = [FF, '-hide_banner', '-loglevel', 'error', '-xerror', '-f', 'lavfi', '-i', screen(c, fps)]
     audio = []
     if 'All apps' not in c['exclude']:  # PC audio from AppAudio; opened right after the video so both start together
         cmd += ['-f', 'f32le', '-ar', '48000', '-ac', '2', '-thread_queue_size', '512', '-i', PIPE]
@@ -845,8 +912,8 @@ def save_cmd(c, lst, out):
         mid = concat + ['-c', 'copy']  # instant, no re-encode
     else:  # re-encode once at save time: NVDEC -> scale_cuda -> NVENC, all on the GPU
         w, h = c['res'].split('x')
-        # ponytail: AMF decodes on the GPU but scales on the CPU; scale_d3d11 is the upgrade if AMD users show up
-        nv = 'nvenc' in c['encoder']
+        # ponytail: non-NVIDIA encoders decode on the GPU but scale on the CPU; scale_d3d11 is the upgrade if it matters
+        nv = 'nvenc' in codec(c)
         mid = (['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'] if nv else ['-hwaccel', 'd3d11va']) + concat + [
             '-vf', f'scale_cuda={w}:{h}' if nv else f'scale={w}:{h}', *enc_args(c), '-c:a', 'copy']
     return [FF, '-y', '-loglevel', 'error'] + mid + ['-movflags', '+faststart', str(out)]
@@ -859,19 +926,25 @@ def newest_segments(length):
 
 class App:
     def __init__(self, root):
-        self.root, self.proc, self.audio, self.started, self.capturing = root, None, None, 0, False
+        self.root, self.proc, self.audio, self.started, self.capturing, self.editing = root, None, None, 0, None, False
+        # forward recording: its segment folder (None = not recording), start time, ring segments already copied
+        self.rec_dir, self.rec_start, self.rec_seen, self.rec_n, self.rec_lock = None, 0, {}, 0, threading.Lock()
         # capture bookkeeping shared with supervise() threads: generation (bumped on every start/stop), quick failures
         # in a row, waiting to retry, status text for the UI thread to show
         self.gen, self.fails, self.retrying, self.note, self.lock = 0, 0, False, None, threading.RLock()
         try: saved = json.loads(CFG.read_text())
         except (OSError, ValueError): saved = {}
         self.cfg = {**DEFAULTS, **saved}
-        hk = self.cfg['hotkey']
-        hk = legacy_hotkey(hk) if isinstance(hk, str) else hk
-        self.hotkey = hk if isinstance(hk, list) and hk and all(isinstance(k, int) for k in hk) else DEFAULTS['hotkey']
-        self.cfg['hotkey'] = self.hotkey
-        self.keys = Keys(lambda: threading.Thread(target=self.save_clip, daemon=True).start(),
-                         lambda text: setattr(self, 'note', text), self.captured)
+        if self.cfg['encoder'] not in ENCODERS: self.cfg['encoder'] = 'Auto'
+        if saved.get('auto_encoder') in ENCODERS: detected['encoder'] = saved['auto_encoder']  # found on an earlier run
+        self.redetect, self.switched = False, False  # probe encoders on the next start; an unusable pick was replaced by Auto
+        self.hotkeys = {}
+        for key in HOTKEYS:
+            hk = self.cfg[key]
+            hk = legacy_hotkey(hk) if isinstance(hk, str) else hk
+            self.hotkeys[key] = self.cfg[key] = hk if isinstance(hk, list) and hk and all(isinstance(k, int) for k in hk) else DEFAULTS[key]
+        self.keys = Keys(lambda i: threading.Thread(target=self.save_clip, daemon=True).start() if i == 1 else
+                         root.after(0, self.toggle_record), lambda text: setattr(self, 'note', text), self.captured)
         self.keys.start()
         self.keys.ready.wait()
         self.monitors = monitors() or ['Display 1']
@@ -894,35 +967,72 @@ class App:
         self.dot.pack(side='left', padx=(1, 7))
         self.status = tk.StringVar()
         ttk.Label(bar, textvariable=self.status, style='Status.TLabel', wraplength=520).pack(side='left')
-        self.rec = ttk.Button(head, width=15, command=self.toggle)
+        self.rec = ttk.Button(head, width=15, command=self.toggle)  # the whole capture (replay buffer) on/off
         self.rec.grid(row=0, column=2, rowspan=2, sticky='e')
 
         ex = self.cfg['exclude']  # older configs stored one name, 'None' or 'All apps'
         self.skip = set([] if ex == 'None' else [ex]) if isinstance(ex, str) else set(ex)
         shown = {**self.cfg, 'monitor': self.monitors[min(int(self.cfg['monitor']), len(self.monitors) - 1)],
                  'exclude': self.skip_text()}
-        columns = [[('CAPTURE', [('Monitor', 'monitor', self.monitors),
-                                 ('Resolution', 'res', ['Native', '3840x2160', '2560x1440', '1920x1080', '1600x900', '1280x720']),
-                                 ('Encoder', 'encoder', ['h264_nvenc', 'hevc_nvenc', 'h264_amf', 'hevc_amf']),
-                                 ('Length (s)', 'length', [15, 30, 45, 60, 90, 120, 180, 300, 600])])],
-                   [('AUDIO', [('Mic', 'audio', ['None'] + audio_devices()),
-                               ('Skip audio of', 'exclude', self.skip_values())]),  # every other app is recorded
-                    ('CLIP', [('Hotkey', 'hotkey', None),
-                              ('Save folder', 'folder', None)])]]
-        self.vars = {}
-        for col, sections in enumerate(columns):
-            f = ttk.Frame(body)
-            f.grid(row=1, column=col, sticky='new', padx=(0, 20) if col == 0 else (20, 0), pady=(18, 0))
-            f.columnconfigure(1, weight=1)
-            i = 0
-            for title, fields in sections:
-                ttk.Label(f, text=title, style='Section.TLabel').grid(row=i, column=0, columnspan=3, sticky='w', pady=((14 if i else 0), 6))
-                for i, (label, key, values) in enumerate(fields, i + 1):
-                    self.field(f, i, label, key, values, shown)
-                i += 1
+        self.vars, self.hk_btns = {}, {}
+
+        def two_columns(parent, row, columns, pady=(18, 0)):  # [[(section title or None, fields)], [...]]
+            for col, sections in enumerate(columns):
+                f = ttk.Frame(parent)
+                f.grid(row=row, column=col, sticky='new', padx=(0, 20) if col == 0 else (20, 0), pady=pady)
+                f.columnconfigure(1, weight=1)
+                i = 0
+                for title, fields in sections:
+                    if title:
+                        ttk.Label(f, text=title, style='Section.TLabel').grid(row=i, column=0, columnspan=3, sticky='w', pady=((14 if i else 0), 6))
+                    for i, (label, key, values) in enumerate(fields, i + 1):
+                        self.field(f, i, label, key, values, shown)
+                    i += 1
+
+        # tabs: what the hotkeys do; the capture settings below are shared by both
+        tabs = ttk.Frame(body)
+        tabs.grid(row=1, column=0, columnspan=2, sticky='w', pady=(20, 0))
+        self.tabs, self.pages = {}, {}
+        for name in ('Instant replay', 'Record'):
+            cell = ttk.Frame(tabs, cursor='hand2')
+            cell.pack(side='left', padx=(0, 26))
+            label = ttk.Label(cell, text=name, style='Tab.TLabel')
+            label.pack(anchor='w')
+            bar = tk.Frame(cell, height=2, bg=BG)
+            bar.pack(fill='x', pady=(6, 0))
+            for w in (cell, label):
+                w.bind('<Button-1>', lambda e, n=name: self.show_tab(n))
+            self.tabs[name] = label, bar
+        tk.Frame(body, height=1, bg=LINE).grid(row=2, column=0, columnspan=2, sticky='ew')
+        for name in self.tabs:
+            page = self.pages[name] = ttk.Frame(body)
+            page.grid(row=3, column=0, columnspan=2, sticky='ew')
+            page.columnconfigure((0, 1), weight=1, uniform='col')
+        two_columns(self.pages['Instant replay'], 0, [[(None, [('Length (s)', 'length', length_values(self.cfg['length']))])],
+                                                      [(None, [('Clip hotkey', 'hotkey', None)])]], pady=(14, 0))
+        rec_left = ttk.Frame(self.pages['Record'])
+        rec_left.grid(row=0, column=0, sticky='new', padx=(0, 20), pady=(14, 0))
+        rec_left.columnconfigure(1, weight=1)
+        ttk.Label(rec_left, text='Recording').grid(row=1, column=0, sticky='w', padx=(0, 20), pady=4)
+        self.rec_btn = ttk.Button(rec_left, style='Accent.TButton', command=self.toggle_record)
+        self.rec_btn.grid(row=1, column=1, sticky='ew', pady=4)
+        rec_right = ttk.Frame(self.pages['Record'])
+        rec_right.grid(row=0, column=1, sticky='new', padx=(20, 0), pady=(14, 0))
+        rec_right.columnconfigure(1, weight=1)
+        self.field(rec_right, 1, 'Record hotkey', 'rec_hotkey', None, shown)
+        root.update_idletasks()
+        body.rowconfigure(3, minsize=max(p.winfo_reqheight() for p in self.pages.values()))  # no jump when switching tabs
+        self.show_tab('Instant replay')
+
+        two_columns(body, 4, [[('CAPTURE', [('Monitor', 'monitor', self.monitors),
+                                            ('Resolution', 'res', ['Native', '3840x2160', '2560x1440', '1920x1080', '1600x900', '1280x720']),
+                                            ('Encoder', 'encoder', ['Auto', *ENCODERS])])],
+                              [('AUDIO', [('Mic', 'audio', ['None'] + audio_devices()),
+                                          ('Skip audio of', 'exclude', self.skip_values())]),  # every other app is recorded
+                               ('SAVE TO', [('Folder', 'folder', None)])]])
 
         q = ttk.Frame(body)
-        q.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(18, 0))
+        q.grid(row=5, column=0, columnspan=2, sticky='ew', pady=(18, 0))
         q.columnconfigure(0, weight=1)
         ttk.Label(q, text='QUALITY', style='Section.TLabel').grid(row=0, column=0, sticky='w')
         self.qinfo = ttk.Label(q)
@@ -943,8 +1053,8 @@ class App:
         self.tray.start()
         self.tray.ready.wait()
         root.bind('<Unmap>', lambda e: e.widget is root and root.state() == 'iconic' and root.withdraw())
-        if self.apply():
-            self.start(wipe=True)
+        if self.apply():  # off the UI thread: the first run probes which encoder works, which takes a second or two
+            threading.Thread(target=self.start, kwargs={'wipe': True}, daemon=True).start()
         self.watchdog()
 
     def skip_values(self):  # apps using audio right now, plus saved picks that aren't running
@@ -965,16 +1075,18 @@ class App:
 
     def field(self, f, i, label, key, values, shown):
         ttk.Label(f, text=label).grid(row=i, column=0, sticky='w', padx=(0, 20), pady=4)
-        if key == 'hotkey':  # click, then press the keys
-            w = self.hk_btn = ttk.Button(f, text=pretty(self.hotkey), style='Field.TButton', command=self.capture)
+        if key in HOTKEYS:  # click, then press the keys
+            w = self.hk_btns[key] = ttk.Button(f, text=pretty(self.hotkeys[key]), style='Field.TButton', command=lambda: self.capture(key))
             w.bind('<KeyPress>', lambda e: 'break' if self.capturing else None)  # keys go to Raw Input, not Tk
-            w.bind('<FocusOut>', lambda e: self.capturing and self.end_capture(None))
+            w.bind('<FocusOut>', lambda e: self.capturing == key and self.end_capture(None))
         else:
             v = self.vars[key] = tk.StringVar(value=str(shown[key]))
-        if values is None and key != 'hotkey':
+        if values is None and key not in HOTKEYS:
             w = ttk.Entry(f, textvariable=v, width=24)
         elif values is not None:
             w = ttk.Combobox(f, textvariable=v, values=values, width=42, state='readonly')
+            if key == 'length':
+                self.len_cb = w
             if key == 'exclude':  # checkbox list
                 w.bind('<Button-1>', lambda e: self.open_skip(e.widget))
                 w.bind('<Down>', lambda e: self.open_skip(e.widget))
@@ -986,37 +1098,116 @@ class App:
         if key == 'folder':
             ttk.Button(f, text='Browse', width=7, command=lambda: v.set(filedialog.askdirectory() or v.get())).grid(row=i, column=2, padx=(8, 0))
 
+    def show_tab(self, name):
+        for n, (label, bar) in self.tabs.items():
+            label.configure(foreground=FG if n == name else MUTED)
+            bar.configure(bg=FG if n == name else BG)
+            (self.pages[n].grid if n == name else self.pages[n].grid_remove)()
 
     def show_preset(self):
         _, fps, br, *_ = PRESETS[self.quality.get()]
         self.qinfo.configure(text=f'{fps} fps  ·  {br} Mbps')
 
     def changed(self, *_):  # debounce: apply 5s after the last edit
+        if self.editing:  # typing a custom length: wait for Enter
+            return
+        if self.vars['length'].get() == CUSTOM:
+            return self.edit_length()
         if self.pending:
             self.root.after_cancel(self.pending)
         self.pending = self.root.after(5000, self.apply)
         self.status.set('Applying changes in 5s')
 
-    def toggle(self):
+    def edit_length(self):
+        """'Custom…' picked: the Length box turns into a text field until Enter / Esc / clicking away."""
+        cb, self.editing = self.len_cb, True
+        cb.configure(state='normal')
+        cb.set('')
+        cb.focus_set()
+        self.status.set('Type a length in seconds (5 to 3600), then Enter · Esc cancels')
+
+        def done(keep):
+            if not self.editing: return
+            self.editing, text = False, cb.get().strip()
+            for ev in ('<Return>', '<Escape>', '<FocusOut>'): cb.unbind(ev)
+            cb.configure(state='readonly')
+            if keep and text.isdigit() and 5 <= int(text) <= 3600:
+                cb.configure(values=length_values(text))
+                cb.set(text)  # saved with the other settings
+            else:
+                cb.set(str(self.cfg['length']))
+                self.status.set('Length must be 5 to 3600 seconds' if keep else self.state_text())
+        cb.bind('<Return>', lambda e: done(True))
+        cb.bind('<Escape>', lambda e: done(False))
+        cb.bind('<FocusOut>', lambda e: done(True))
+
+    def toggle(self):  # capture (replay buffer) on/off
         if self.pending:  # apply edits right away instead of waiting out the timer
             self.root.after_cancel(self.pending)
             if not self.apply(): return
         if self.proc or self.retrying:
+            if self.rec_dir: self.toggle_record()  # a recording needs the capture: save it first
             self.stop()
         else:
             self.start(wipe=True)
         self.sync_ui()
 
-    def capture(self):
-        self.capturing, self.keys.capture = True, []
-        self.keys.update()  # drops our registered hotkey (Windows would swallow it) and listens via Raw Input
-        self.hk_btn.configure(text='Press your keys · Esc cancels')
-        self.hk_btn.focus_set()
+    def toggle_record(self):
+        """Forward recording. No second capture: finished 2 s segments of the running one are copied out of the ring
+        before it wraps over them, and joined into one mp4 at the end. Clips keep working meanwhile."""
+        if self.rec_dir:
+            d, start, self.rec_dir = self.rec_dir, self.rec_start, None
+            threading.Thread(target=self.finish_record, args=(d, start), daemon=True).start()
+            return self.sync_ui()
+        if not (self.proc or self.retrying):
+            self.start(wipe=True)
+        d = Path(self.cfg['folder']) / '.recording'
+        try:
+            shutil.rmtree(d, ignore_errors=True)
+            d.mkdir(parents=True)
+            kernel32.SetFileAttributesW(str(d), 2)  # hidden
+        except OSError as e:
+            return self.status.set(f"Can't record: {e}")
+        self.rec_dir, self.rec_start, self.rec_seen, self.rec_n = d, time.time(), {}, 0
+        threading.Thread(target=self.harvest_loop, args=(d,), daemon=True).start()
+        self.sync_ui()
+
+    def harvest(self, d, final=False):
+        """Copy this recording's finished segments out of the ring buffer (and, at the end, the one in progress)."""
+        with self.rec_lock:
+            segs = sorted(BUF.glob('buf*.ts'), key=lambda p: p.stat().st_mtime)
+            for s in segs if final else segs[:-1]:  # the newest is still being written
+                st = s.stat()
+                if st.st_mtime > self.rec_start and self.rec_seen.get(s.name) != st.st_mtime_ns:  # new since start / last copy
+                    shutil.copyfile(s, d / f'{self.rec_n:06d}.ts')
+                    self.rec_seen[s.name], self.rec_n = st.st_mtime_ns, self.rec_n + 1
+
+    def harvest_loop(self, d):  # every second: well inside the ring's 12+ s before a slot gets reused
+        while self.rec_dir == d:
+            try: self.harvest(d)
+            except OSError: pass  # a segment went away mid-copy (capture restarting): next round gets it
+            time.sleep(1)
+
+    def finish_record(self, d, start):
+        try: self.harvest(d, final=True)
+        except OSError: pass
+        files = sorted(d.glob('*.ts'))
+        if files:
+            self.export(files, Path(self.cfg['folder']) / time.strftime('Recording_%Y-%m-%d_%H-%M-%S.mp4', time.localtime(start)), d)
+        else:
+            self.note = 'Recording was empty'
+        shutil.rmtree(d, ignore_errors=True)
+
+    def capture(self, which):
+        self.capturing, self.keys.capture = which, []
+        self.keys.update()  # drops our registered hotkeys (Windows would swallow them) and listens via Raw Input
+        self.hk_btns[which].configure(text='Press your keys · Esc cancels')
+        self.hk_btns[which].focus_set()
 
     def captured(self, combo):  # from the Keys thread: live progress, None = cancelled
         if combo is None:
             return self.end_capture(None)
-        self.hk_btn.configure(text=pretty(combo) + '  …')
+        self.hk_btns[self.capturing].configure(text=pretty(combo) + '  …')
         self.root.after(int(Keys.WINDOW * 1000) + 50, self.finish_capture)
 
     def finish_capture(self):  # done once every key is up and no new one came within WINDOW
@@ -1028,16 +1219,21 @@ class App:
         self.end_capture(list(k.capture))
 
     def end_capture(self, combo):
-        self.capturing, self.keys.capture = False, None
-        if combo and combo != self.hotkey:
-            self.hotkey = combo
+        which, self.capturing, self.keys.capture = self.capturing, None, None
+        other = next(k for k in HOTKEYS if k != which)
+        if combo and combo == self.hotkeys[other]:
+            self.status.set(f"{pretty(combo)} is already the {'clip' if other == 'hotkey' else 'record'} hotkey")
+        elif combo and combo != self.hotkeys[which]:
+            self.hotkeys[which] = combo
             self.changed()  # saved with the other settings
-        self.hk_btn.configure(text=pretty(self.hotkey))
-        self.keys.combo = self.hotkey
+        self.hk_btns[which].configure(text=pretty(self.hotkeys[which]))
+        self.keys.combos = {HOTKEYS[k]: v for k, v in self.hotkeys.items()}
         self.keys.update()  # re-arm right away
 
     def state_text(self):
-        return f"Recording · {pretty(self.cfg['hotkey'])} saves the last {self.cfg['length']}s" if self.proc else 'Stopped'
+        if not self.proc: return 'Capture off'
+        cpu = ' · CPU encoding: no GPU encoder worked on this PC' if codec(self.cfg) == 'libx264' and self.cfg['encoder'] == 'Auto' else ''
+        return f"Capturing · {pretty(self.cfg['hotkey'])} saves the last {self.cfg['length']}s{cpu}"
 
     def show_state(self):
         self.status.set(self.state_text())
@@ -1047,14 +1243,22 @@ class App:
         note, self.note = self.note, None
         if note:
             self.status.set(self.state_text() if note == 'state' else note)
+        if self.switched:  # the picked encoder can't run here: show (and soon save) that Auto took over
+            self.switched = False
+            self.vars['encoder'].set('Auto')
         self.refresh()
 
     def refresh(self):
         on = bool(self.proc or self.retrying)  # retrying still counts as on: the user didn't stop it
-        if getattr(self, 'shown', None) != (on, bool(self.proc)):  # touch the widgets only on change
-            self.shown = on, bool(self.proc)
+        t = int(time.time() - self.rec_start) if self.rec_dir else -1
+        rec = f'Stop recording · {t // 3600}:{t // 60 % 60:02}:{t % 60:02}' if self.rec_dir else 'Start recording'
+        state = on, bool(self.proc), rec
+        if getattr(self, 'shown', None) != state:  # touch the widgets only on change
+            self.shown = state
             self.dot.configure(foreground=FG if self.proc else DIM)
-            self.rec.configure(text='Stop recording' if on else 'Start recording', style='Big.TButton' if on else 'Accent.TButton')
+            self.rec.configure(text='Stop capture' if on else 'Start capture', style='Big.TButton' if on else 'Accent.TButton')
+            self.rec_btn.configure(text=rec, style='Big.TButton' if self.rec_dir else 'Accent.TButton')
+            self.tabs['Record'][0].configure(text='Record  ●' if self.rec_dir else 'Record')  # visible from the other tab too
 
     def apply(self):
         self.pending = None
@@ -1063,14 +1267,15 @@ class App:
             c['monitor'] = self.monitors.index(c['monitor']) if c['monitor'] in self.monitors else 0
             c['quality'] = self.quality.get()
             c['length'] = int(c['length'])
+            if not 5 <= c['length'] <= 3600: raise ValueError('length must be 5 to 3600 seconds')
             if c['res'] != 'Native' and not re.fullmatch(r'\d+x\d+', c['res']): raise ValueError('resolution must be WxH')
-            c['hotkey'], c['exclude'] = self.hotkey, sorted(self.skip, key=str.lower)
+            c.update(self.hotkeys, exclude=sorted(self.skip, key=str.lower), auto_encoder=detected.get('encoder'))
         except (ValueError, KeyError) as e:
             return self.status.set(f'Invalid setting: {e}')
         old, self.cfg = self.cfg, c
         CFG.write_text(json.dumps(c, indent=2))
         if not self.capturing:
-            self.keys.combo = self.hotkey
+            self.keys.combos = {HOTKEYS[k]: v for k, v in self.hotkeys.items()}
             self.keys.update()
         if self.audio:
             self.audio.skip = set(c['exclude'])  # picked up within a second, no ffmpeg restart
@@ -1089,8 +1294,20 @@ class App:
                 return
             self.gen += 1  # first: the old supervisor must see its capture was replaced, not crashed
             self.halt()
+            if self.redetect or (self.cfg['encoder'] == 'Auto' and 'encoder' not in detected):
+                self.redetect = False
+                enc, detected['errors'] = detect_encoder(self.cfg['monitor'], self.cfg['encoder'])  # the pick goes first
+                if enc:
+                    detected['encoder'] = enc
+                    if self.cfg['encoder'] not in ('Auto', enc):  # e.g. h264_nvenc saved on a PC without NVIDIA
+                        self.cfg['encoder'], self.switched = 'Auto', True
+                    try: CFG.write_text(json.dumps({**self.cfg, 'auto_encoder': enc}, indent=2))  # skip the probe next launch
+                    except OSError: pass
             BUF.mkdir(exist_ok=True)
             if wipe:
+                if self.rec_dir:  # a recording is running: grab its last seconds before they're wiped
+                    try: self.harvest(self.rec_dir, final=True)
+                    except OSError: pass
                 for f in BUF.glob('buf*.ts'): f.unlink()
             if 'All apps' not in self.cfg['exclude']:  # the pipe must exist before ffmpeg tries to open it
                 self.audio = AppAudio(set(self.cfg['exclude']), lambda text: setattr(self, 'note', text))
@@ -1115,8 +1332,11 @@ class App:
                 return  # stopped or replaced on purpose
             err = (BUF / 'ffmpeg.log').read_text(errors='ignore').strip().splitlines()
             self.fails = 1 if time.time() - self.started > 10 else self.fails + 1
+            self.redetect = self.fails % 10 == 2  # keeps failing at once: maybe this encoder can't run here, look for one that can
             self.halt()
-            self.retrying, self.note = True, 'Capture interrupted, retrying · ' + (err[-1][-90:] if err else 'unknown error')
+            # the first log line is the cause (the last is ffmpeg's generic 'nothing was written'), minus its '[tag @ addr]'
+            cause = re.sub(r'^\[[^\]]*\]\s*', '', err[0])[:90] if err else 'no error message'
+            self.retrying, self.note = True, f'Screen capture interrupted (locked, asleep or switching display?), retrying · {cause}'
         # right away after a healthy run (the mode switch is over once capture dies), every second while it
         # can't start yet, every 5 s after ~15 s (lock screen)
         time.sleep(0 if self.fails == 1 else 1 if self.fails < 15 else 5)
@@ -1144,10 +1364,13 @@ class App:
     def save_clip(self):
         files = newest_segments(self.cfg['length'])
         if not (self.proc or self.retrying) or not files:  # while retrying, what came before the interruption still saves
-            self.note = 'Not recording, nothing to save'
+            self.note = 'Capture is off, nothing to save'
             return winsound.MessageBeep(winsound.MB_ICONHAND)
-        out = Path(self.cfg['folder']) / time.strftime('Clip_%Y-%m-%d_%H-%M-%S.mp4')
-        lst = BUF / f'{out.stem}.txt'
+        self.export(files, Path(self.cfg['folder']) / time.strftime('Clip_%Y-%m-%d_%H-%M-%S.mp4'), BUF)
+
+    def export(self, files, out, scratch):
+        """Join segments into out (stream copy at Native res), then chime. Runs on a worker thread."""
+        lst = scratch / f'{out.stem}.txt'
         try:
             out.parent.mkdir(parents=True, exist_ok=True)
             lst.write_text(''.join(f"file '{f.as_posix()}'\n" for f in files))
@@ -1171,6 +1394,11 @@ class App:
 
     def quit(self):
         self.tray.remove()
+        if self.rec_dir:  # save the recording before its segments go away
+            d, self.rec_dir = self.rec_dir, None
+            self.status.set('Saving recording...')
+            self.root.update()
+            self.finish_record(d, self.rec_start)
         self.stop()
         shutil.rmtree(BUF, ignore_errors=True)
         self.root.destroy()
@@ -1179,12 +1407,12 @@ class App:
 if __name__ == '__main__':
     if sys.argv[1:] == ['--test']:
         fired = []
-        k = Keys(lambda: fired.append(1), print, print)  # thread not started: feed key() by hand
+        k = Keys(fired.append, print, print)  # thread not started: feed key() by hand; fired gets hotkey ids
         down, up = lambda c, t, fl=0: k.key(c & 0xFF, fl | (2 if c & 0x100 else 0), 1, t), \
             lambda c, t: k.key(c & 0xFF, 1 | (2 if c & 0x100 else 0), 1, t)
         tap = lambda c, t: (down(c, t), up(c, t + .05))
         N, M, DOT, SHIFT, RSHIFT, F10 = 0x31, 0x32, 0x34, 0x2A, 0x36, 0x44
-        k.combo = [N, M, DOT]
+        k.combos = {1: [N, M, DOT]}
         tap(N, 0); tap(M, .2); tap(DOT, .4)
         assert fired == [1], 'quick n, m, . fires'
         tap(N, 5); tap(M, 5.2); tap(DOT, 5.9)
@@ -1193,16 +1421,28 @@ if __name__ == '__main__':
         assert fired == [1], 'the last key is the trigger'
         tap(M, 20); tap(N, 20.1); down(DOT, 20.2); down(DOT, 20.25); down(DOT, 20.28); up(DOT, 20.3)
         assert fired == [1, 1], 'any order before the trigger; holding it fires once'
-        k.combo = [SHIFT, F10]
+        k.combos = {1: [SHIFT, F10]}
         down(RSHIFT, 30); down(RSHIFT, 30.5); down(RSHIFT, 30.9); tap(F10, 31)
         assert fired == [1, 1, 1], 'right Shift counts as Shift, held (repeating) modifier counts'
         k.key(0x2A, 2, 1, 40); tap(F10, 40.1)
         assert fired == [1, 1, 1], "Windows' fake E0 Shift is ignored"
+        k.combos = {1: [N, DOT], 2: [M, DOT]}
+        tap(M, 45); tap(DOT, 45.1)
+        assert fired == [1, 1, 1, 2], 'two hotkeys: each fires its own id'
+        assert length_values(75) == [15, 30, 45, 60, 75, 90, 120, 180, 300, 600, CUSTOM] and length_values('60')[-2:] == [600, CUSTOM]
         k.capture = []
         tap(N, 50); tap(DOT, 50.1); tap(N, 50.2)
         assert k.capture == [N, DOT], 'capture records each key once, in order'
         assert legacy_hotkey('N') == [N] and legacy_hotkey('alt+F10') == [0x38, F10], 'old configs convert'
         assert legacy_hotkey('ctrl+shift+K') == [0x1D, SHIFT, 0x25] and legacy_hotkey('huh+X') is None
+        c = dict(DEFAULTS, encoder='Auto')
+        assert codec(c) == AUTO[0], 'Auto before detection: first choice'
+        detected['encoder'] = 'libx264'
+        assert codec(c) == 'libx264' and codec(dict(c, encoder='hevc_amf')) == 'hevc_amf', 'Auto follows detection, a pick wins'
+        assert 'hwdownload' in screen(c, 60) and enc_args(c)[:4] == ['-c:v', 'libx264', '-preset', 'superfast']
+        assert enc_args(dict(c, encoder='h264_nvenc', quality=4))[:6] == ['-c:v', 'h264_nvenc', '-preset', 'p5', '-bf', '0']
+        assert all(len(v[2]) == len(PRESETS) for v in ENCODERS.values()) and set(AUTO) <= set(ENCODERS)
+        del detected['encoder']
         mixed = array('f', mix([array('f', [.25, -.5]).tobytes(), array('f', [.5, .25]).tobytes()]))
         assert list(mixed) == [.75, -.25], 'mix sums samples'
         sys.exit(print('ok'))
