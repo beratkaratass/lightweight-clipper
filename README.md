@@ -33,6 +33,7 @@ The first time, Windows SmartScreen may say *"Windows protected your PC"*, becau
 - **Record normally:** open the *Record* tab and press *Start recording*, or press **Alt + F9** to start and stop. Clips still work while you record.
 - **Clips and recordings go to** `Videos\Lightweight Clipper` (change it under *Save to*).
 - **Minimize** hides it to the tray (the **^** by the clock). Click the tray icon to bring it back; right-click it to quit.
+- **Starts with Windows**, straight into the tray. Turn that off in *Task Manager → Startup apps*.
 - **Quality slider:** *Max FPS* is lightest on your game, *Max quality* looks best.
 - **Skip audio of:** tick apps whose sound you don't want in clips (e.g. Discord, Spotify). Everything else is recorded, plus your mic if you pick one.
 - Settings save themselves 5 s after you change them, in `config.json` next to the exe.

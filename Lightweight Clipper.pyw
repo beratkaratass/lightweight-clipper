@@ -2,7 +2,7 @@
 ffmpeg ddagrab (GPU desktop capture) -> GPU encoder, zero-copy (frames never touch the CPU)
 -> ring of 2s .ts segments in %TEMP%. Hotkey joins the newest ones into an mp4: stream copy at Native res,
 GPU re-encode only when a smaller resolution is picked."""
-import ctypes, io, json, math, operator, os, re, shutil, subprocess, sys, threading, time, uuid, wave, winsound
+import ctypes, io, json, math, operator, os, re, shutil, subprocess, sys, threading, time, uuid, wave, winreg, winsound
 from array import array
 from ctypes import wintypes
 from pathlib import Path
@@ -1453,6 +1453,11 @@ if __name__ == '__main__':
         sys.exit()
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('LightweightClipper')  # own taskbar entry + icon, not Python's
+    if getattr(sys, 'frozen', False):  # start with Windows, in the tray (Task Manager > Startup apps turns it off)
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r'Software\Microsoft\Windows\CurrentVersion\Run') as run:
+            winreg.SetValueEx(run, NAME, 0, winreg.REG_SZ, f'"{sys.executable}" --minimized')
     root = tk.Tk()
+    if '--minimized' in sys.argv:
+        root.withdraw()  # never shown until the tray icon is clicked
     App(root)
     root.mainloop()
