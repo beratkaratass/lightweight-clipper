@@ -861,7 +861,7 @@ def enc_args(c):
     return ['-c:v', codec(c), option, levels[c['quality']], *extra, '-b:v', f'{br}M', '-maxrate', f'{br}M', '-bufsize', f'{br * 2}M']
 
 
-def detect_encoder(monitor, first=None):
+def detect_encoder(monitor, first=None, again=True):
     """The first encoder that really records this screen: `first` (the user's pick), then the Auto order.
     Handles AMD and Intel GPUs, laptops whose display runs off the integrated GPU, drivers too old for NVENC...
     Returns (encoder or None, [why each one before it failed])."""
@@ -875,8 +875,9 @@ def detect_encoder(monitor, first=None):
         except (OSError, subprocess.TimeoutExpired) as e:
             errors.append(f'{enc}: {e}')
             continue
-        if r.returncode == 0:
-            return enc, errors
+        if r.returncode == 0:  # the screen records now: the ones before may have failed on the capture (display mode
+            # switch, unlock), not the encoder, so give them one more go before settling for a fallback like CPU encoding
+            return detect_encoder(monitor, first, False) if errors and again else (enc, errors)
         errors.append(f'{enc}: ' + re.sub(r'^\[[^\]]*\]\s*', '', (r.stderr.strip().splitlines() or ['failed'])[0]))
     return None, errors
 
@@ -1443,6 +1444,11 @@ if __name__ == '__main__':
         assert enc_args(dict(c, encoder='h264_nvenc', quality=4))[:6] == ['-c:v', 'h264_nvenc', '-preset', 'p5', '-bf', '0']
         assert all(len(v[2]) == len(PRESETS) for v in ENCODERS.values()) and set(AUTO) <= set(ENCODERS)
         del detected['encoder']
+        runs = iter([1, 1, 1, 0, 0, 1, 0, 1, 0])  # probe exit codes, in call order
+        real, subprocess.run = subprocess.run, lambda *a, **k: subprocess.CompletedProcess(a, next(runs), '', 'x')
+        assert detect_encoder(0)[0] == 'h264_nvenc', 'screen came back mid-probe: NVENC re-tested, not CPU kept'
+        assert detect_encoder(0)[0] == 'h264_amf', 'NVENC really fails: AMF still wins on the second pass'
+        subprocess.run = real
         mixed = array('f', mix([array('f', [.25, -.5]).tobytes(), array('f', [.5, .25]).tobytes()]))
         assert list(mixed) == [.75, -.25], 'mix sums samples'
         sys.exit(print('ok'))
