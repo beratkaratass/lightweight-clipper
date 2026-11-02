@@ -1327,6 +1327,13 @@ class App:
     def supervise(self, proc, gen):
         """Restart a capture that died (a game's display mode switch, lock screen, UAC) right here, not on the UI
         thread: Windows stalls that one for a second or two during mode switches."""
+        # a game holding the GPU at 100% (uncapped fps) starves the screen copy: clips froze 0.1-0.4 s at a time. Raise
+        # ffmpeg's GPU priority to High; Windows only takes it once ffmpeg has opened the GPU, a moment after launch.
+        # ponytail: High needs no admin; Realtime (5) does, the upgrade if games still win
+        for _ in range(50):
+            if proc.poll() is not None or not ctypes.windll.gdi32.D3DKMTSetProcessSchedulingPriorityClass(wintypes.HANDLE(proc._handle), 4):
+                break
+            time.sleep(.1)
         proc.wait()
         with self.lock:
             if gen != self.gen:
