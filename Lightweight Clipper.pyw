@@ -887,14 +887,18 @@ def record_cmd(c):
     fps = PRESETS[c['quality']][1]
     # -xerror: if the capture dies (display mode change, lock screen, UAC), exit instead of carrying on audio-only,
     # which piled hours of audio into one segment; the watchdog then restarts capture
-    cmd = [FF, '-hide_banner', '-loglevel', 'error', '-xerror', '-f', 'lavfi', '-i', screen(c, fps)]
+    # ffmpeg pauses the screen capture while an audio stream looks 100+ ms behind. Zeroing each input's clock on its
+    # own made the mic (slow to open) look ~300 ms behind for good, and clips froze for 0.1-0.3 s several times a
+    # second: every input is stamped with its arrival time instead, and -copyts keeps that one shared clock
+    now = ['-use_wallclock_as_timestamps', '1']
+    cmd = [FF, '-hide_banner', '-loglevel', 'error', '-xerror', '-copyts', *now, '-f', 'lavfi', '-i', screen(c, fps)]
     audio = []
-    if 'All apps' not in c['exclude']:  # PC audio from AppAudio; opened right after the video so both start together
-        cmd += ['-f', 'f32le', '-ar', '48000', '-ac', '2', '-thread_queue_size', '512', '-i', PIPE]
-        audio.append(f'{len(audio) + 1}:a')
-    if c['audio'] != 'None':  # mic
-        cmd += ['-f', 'dshow', '-audio_buffer_size', '50', '-i', f"audio={c['audio']}"]
-        audio.append(f'{len(audio) + 1}:a')
+    if c['audio'] != 'None':  # mic before PC audio: amix pairs samples by count, so the input opened first builds a
+        cmd += [*now, '-f', 'dshow', '-audio_buffer_size', '50', '-i', f"audio={c['audio']}"]  # backlog; the pipe
+        audio.append(f'{len(audio) + 1}:a')  # opens at once, the mic doesn't
+    if 'All apps' not in c['exclude']:  # PC audio from AppAudio, first in the mix: amix keeps the first input's clock
+        cmd += [*now, '-f', 'f32le', '-ar', '48000', '-ac', '2', '-thread_queue_size', '512', '-i', PIPE]
+        audio.insert(0, f'{len(audio) + 1}:a')
     cmd += ['-map', '0:v']
     if len(audio) == 2:
         cmd += ['-filter_complex', f'[{audio[0]}][{audio[1]}]amix=inputs=2:normalize=0[a]', '-map', '[a]']
@@ -1374,9 +1378,11 @@ class App:
         if not (self.proc or self.retrying) or not files:  # while retrying, what came before the interruption still saves
             self.note = 'Capture is off, nothing to save'
             return winsound.MessageBeep(winsound.MB_ICONHAND)
-        self.export(files, Path(self.cfg['folder']) / time.strftime('Clip_%Y-%m-%d_%H-%M-%S.mp4'), BUF)
+        # chime now: the clip is these segments, and writing a long one out takes 10-20 s in a game
+        threading.Thread(target=winsound.PlaySound, args=(CHIME, winsound.SND_MEMORY), daemon=True).start()
+        self.export(files, Path(self.cfg['folder']) / time.strftime('Clip_%Y-%m-%d_%H-%M-%S.mp4'), BUF, chime=False)
 
-    def export(self, files, out, scratch):
+    def export(self, files, out, scratch, chime=True):
         """Join segments into out (stream copy at Native res), then chime. Runs on a worker thread."""
         lst = scratch / f'{out.stem}.txt'
         try:
@@ -1390,7 +1396,7 @@ class App:
         except OSError as e:
             ok, err = False, str(e)
         if ok:  # we're on the save thread, so playing synchronously blocks nothing
-            winsound.PlaySound(CHIME, winsound.SND_MEMORY)
+            chime and winsound.PlaySound(CHIME, winsound.SND_MEMORY)
         else:
             winsound.MessageBeep(winsound.MB_ICONHAND)
         self.note = f'Saved {out.name}' if ok else f'Save failed: {err}'
@@ -1451,6 +1457,9 @@ if __name__ == '__main__':
         assert enc_args(dict(c, encoder='h264_nvenc', quality=4))[:6] == ['-c:v', 'h264_nvenc', '-preset', 'p5', '-bf', '0']
         assert all(len(v[2]) == len(PRESETS) for v in ENCODERS.values()) and set(AUTO) <= set(ENCODERS)
         del detected['encoder']
+        rc = record_cmd(dict(DEFAULTS, audio='Mic', exclude=[]))
+        assert '-copyts' in rc and rc.index('dshow') < rc.index(PIPE) and '[2:a][1:a]amix=inputs=2:normalize=0[a]' in rc, \
+            'shared clock, mic opened before PC audio, PC audio first in the mix'
         runs = iter([1, 1, 1, 0, 0, 1, 0, 1, 0])  # probe exit codes, in call order
         real, subprocess.run = subprocess.run, lambda *a, **k: subprocess.CompletedProcess(a, next(runs), '', 'x')
         assert detect_encoder(0)[0] == 'h264_nvenc', 'screen came back mid-probe: NVENC re-tested, not CPU kept'
